@@ -19,6 +19,13 @@ def get_train_config(config_file='config/train_config.yaml'):
 
     return cfg
 
+def get_test_config(config_file='config/test_config.yaml'):
+    with open(config_file, 'r') as f:
+        cfg = yaml.load(f, Loader=yaml.loader.SafeLoader)
+
+    _check_dir(cfg['dataset']['data_root'], make_dir=False)
+
+    return cfg
 
 if __name__ == '__main__':
     cfg = get_train_config('train_config.yaml')
