@@ -115,6 +115,74 @@ class StructuralDescriptor(nn.Module):
         # (b, 64+num_kernel+3(normal), num_face) --mlp--> (b, 131, num_face)
         return self.structural_mlp(torch.cat([structural_fea1, structural_fea2, normals], 1))
 
+class MeshConvolution(nn.Module):
+
+    def __init__(self, cfg, spatial_in_channel, structural_in_channel, spatial_out_channel, structural_out_channel):
+        super(MeshConvolution, self).__init__()
+
+        self.spatial_in_channel = spatial_in_channel
+        self.structural_in_channel = structural_in_channel
+        self.spatial_out_channel = spatial_out_channel
+        self.structural_out_channel = structural_out_channel
+
+        assert cfg['aggregation_method'] in ['Concat', 'Max', 'Average']
+        self.aggregation_method = cfg['aggregation_method']
+
+        self.combination_mlp = nn.Sequential(
+            nn.Conv1d(self.spatial_in_channel + self.structural_in_channel, self.spatial_out_channel, 1),
+            nn.BatchNorm1d(self.spatial_out_channel),
+            nn.ReLU(),
+        )
+
+        if self.aggregation_method == 'Concat':
+            self.concat_mlp = nn.Sequential(
+                nn.Conv2d(self.structural_in_channel * 2, self.structural_in_channel, 1),
+                nn.BatchNorm2d(self.structural_in_channel),
+                nn.ReLU(),
+            )
+
+        self.aggregation_mlp = nn.Sequential(
+            nn.Conv1d(self.structural_in_channel, self.structural_out_channel, 1),
+            nn.BatchNorm1d(self.structural_out_channel),
+            nn.ReLU(),
+        )
+
+    def forward(self, spatial_fea, structural_fea, neighbor_index):
+        b, _, n = spatial_fea.size() # (b, 64, num_face), 64: spatial desc output dim
+
+        # Combination
+        # concat feat (b, 64+131, num_face) --mlp--> (b, spatial_out, num_face)
+        spatial_fea = self.combination_mlp(torch.cat([spatial_fea, structural_fea], 1))
+
+        # Aggregation
+        if self.aggregation_method == 'Concat':
+            # Gathering
+            # For each structural feature of face, concatenate structural feature of neighboring three faces (b, 131+131, num_face, 3)
+            structural_fea = torch.cat([structural_fea.unsqueeze(3).expand(-1, -1, -1, 3),
+                                        torch.gather(structural_fea.unsqueeze(3).expand(-1, -1, -1, 3), 2,
+                                                     neighbor_index.unsqueeze(1).expand(-1, self.structural_in_channel,
+                                                                                        -1, -1))], 1)
+            structural_fea = self.concat_mlp(structural_fea) # squash(?) concatenated structural feature into single vector using mlp(conv2d impl) (b, 131, num_face, 3)
+            structural_fea = torch.max(structural_fea, 3)[0] # max pool between those three (b, 131, num_face)
+
+        elif self.aggregation_method == 'Max':
+            structural_fea = torch.cat([structural_fea.unsqueeze(3),
+                                        torch.gather(structural_fea.unsqueeze(3).expand(-1, -1, -1, 3), 2,
+                                                     neighbor_index.unsqueeze(1).expand(-1, self.structural_in_channel,
+                                                                                        -1, -1))], 3)
+            structural_fea = torch.max(structural_fea, 3)[0]
+
+        elif self.aggregation_method == 'Average':
+            structural_fea = torch.cat([structural_fea.unsqueeze(3),
+                                        torch.gather(structural_fea.unsqueeze(3).expand(-1, -1, -1, 3), 2,
+                                                     neighbor_index.unsqueeze(1).expand(-1, self.structural_in_channel,
+                                                                                        -1, -1))], 3)
+            structural_fea = torch.sum(structural_fea, dim=3) / 4
+
+        structural_fea = self.aggregation_mlp(structural_fea) # (b, structural_out, num_face)
+
+        return spatial_fea, structural_fea
+
 if __name__ == '__main__':
     num_batch = 16
     num_point = 1024
@@ -145,4 +213,10 @@ if __name__ == '__main__':
     sd = StructuralDescriptor(cfg)
     structural_feat = sd(corners,normals,neighbor_indices)
     print(structural_feat.shape)
+
+    cfg = {'aggregation_method':'Concat'}
+    mc = MeshConvolution(cfg, 64, 131, 256, 256) # (spatial_in, structural_in, spatial_out, structural_out)
+    spatial_feat_out, structural_feat_out = mc(spatial_feat, structural_feat, neighbor_indices)
+    print('spatial feat after conv {}'.format(spatial_feat_out.shape))
+    print('structural feat after conv {}'.format(structural_feat_out.shape))
 
